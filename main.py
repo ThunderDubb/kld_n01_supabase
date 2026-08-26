@@ -32,17 +32,9 @@ MAX_DISCOVERY_PAGES_PER_SOURCE = 100
 
 TMID_PATTERNS = [
     re.compile(
-        r"(?:tmid|TMID)[\"'\s:=?&%]+([A-Za-z0-9_-]+)",
-        re.IGNORECASE,
-    ),
-    re.compile(
         r"[?&]tmid=([A-Za-z0-9_-]+)",
         re.IGNORECASE,
-    ),
-    re.compile(
-        r"[^\"']+[\"']",
-        re.IGNORECASE,
-    ),
+    )
 ]
 
 
@@ -212,6 +204,10 @@ def discover_tmids(source_url):
         len(found_tmids),
     )
 
+    print("TMID FOUND:")
+    for t in sorted(found_tmids):
+        print(t)
+    
     return found_tmids
 
 
