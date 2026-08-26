@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 import psycopg
@@ -40,10 +40,14 @@ USER_AGENT = (
 )
 
 REQUEST_TIMEOUT = 30
-REQUEST_DELAY_SECONDS = 0.6
+REQUEST_DELAY_SECONDS = 0.25
 
 TOURNAMENT_PAGE_SIZE = 30
 MAX_TOURNAMENT_PAGES = 500
+
+# Pierwsze uruchomienie po zmianie może przejrzeć całą historię.
+# Szczegółowe dane zostaną jednak pobrane tylko dla brakujących tmid.
+STOP_AFTER_EXISTING_PAGES = 0
 
 
 # ============================================================
@@ -54,11 +58,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
-
-# ============================================================
-# SESJA HTTP
-# ============================================================
 
 session = requests.Session()
 
@@ -71,81 +70,41 @@ session.headers.update(
 
 
 # ============================================================
-# PODSTAWOWE FUNKCJE POMOCNICZE
+# IDENTYFIKATORY I URL
 # ============================================================
 
 def is_valid_identifier(value):
-    """
-    Sprawdza, czy identyfikator N01 zawiera wyłącznie:
-    - litery,
-    - cyfry,
-    - podkreślenie,
-    - myślnik.
-    """
-
     if not isinstance(value, str):
         return False
 
-    normalized = value.strip()
+    value = value.strip()
 
-    if not normalized:
-        return False
-
-    if len(normalized) > 150:
+    if not value or len(value) > 150:
         return False
 
     return bool(
         re.fullmatch(
             r"[A-Za-z0-9_-]+",
-            normalized,
+            value,
         )
     )
 
 
-def is_valid_tmid(value):
-    """
-    Sprawdza poprawność techniczną tmid.
-    """
-
-    return is_valid_identifier(value)
-
-
-def is_valid_tdid(value):
-    """
-    Sprawdza poprawność techniczną tdid.
-    """
-
-    return is_valid_identifier(value)
-
-
 def get_query_parameter(source_url, parameter_name):
-    """
-    Pobiera parametr z adresu URL.
-
-    Przykłady:
-    - lgid z portal.php?lgid=...
-    - id z comp.php?id=...
-    """
-
     parsed_url = urlparse(source_url)
-    query_params = parse_qs(parsed_url.query)
-
-    values = query_params.get(parameter_name, [])
+    parameters = parse_qs(parsed_url.query)
+    values = parameters.get(parameter_name, [])
 
     if not values:
         raise ValueError(
-            f"Nie znaleziono parametru "
-            f"{parameter_name} w adresie: {source_url}"
+            f"Brak parametru {parameter_name} "
+            f"w adresie {source_url}"
         )
 
     return values[0]
 
 
 def get_league_id(source_url):
-    """
-    Pobiera identyfikator ligi lgid.
-    """
-
     return get_query_parameter(
         source_url,
         "lgid",
@@ -153,39 +112,29 @@ def get_league_id(source_url):
 
 
 def get_tournament_id(source_url):
-    """
-    Pobiera identyfikator wydarzenia/turnieju z parametru id.
-    """
-
     return get_query_parameter(
         source_url,
         "id",
     )
 
 
+# ============================================================
+# PRZESZUKIWANIE JSON
+# ============================================================
+
 def extract_ids_by_key(value, key_name):
-    """
-    Rekurencyjnie przegląda JSON i zbiera wartości pola
-    o podanej nazwie.
-
-    Przykłady:
-    - tdid,
-    - tmid.
-
-    Obsługuje zarówno listy, jak i zagnieżdżone słowniki.
-    """
-
-    found_values = set()
+    found = set()
 
     if isinstance(value, dict):
         for key, item in value.items():
             if str(key).lower() == key_name.lower():
                 if item not in (None, ""):
-                    found_values.add(
-                        str(item).strip()
-                    )
+                    identifier = str(item).strip()
 
-            found_values.update(
+                    if is_valid_identifier(identifier):
+                        found.add(identifier)
+
+            found.update(
                 extract_ids_by_key(
                     item,
                     key_name,
@@ -194,37 +143,28 @@ def extract_ids_by_key(value, key_name):
 
     elif isinstance(value, list):
         for item in value:
-            found_values.update(
+            found.update(
                 extract_ids_by_key(
                     item,
                     key_name,
                 )
             )
 
-    return found_values
+    return found
 
 
 def extract_tmids_from_urls(value):
-    """
-    Dodatkowe zabezpieczenie.
-
-    Jeżeli tmid nie występuje jako osobne pole JSON,
-    funkcja próbuje znaleźć go w tekstach i adresach URL,
-    np.:
-    n01_view.html?tmid=abc_123
-    """
-
-    found_tmids = set()
+    found = set()
 
     if isinstance(value, dict):
         for item in value.values():
-            found_tmids.update(
+            found.update(
                 extract_tmids_from_urls(item)
             )
 
     elif isinstance(value, list):
         for item in value:
-            found_tmids.update(
+            found.update(
                 extract_tmids_from_urls(item)
             )
 
@@ -236,41 +176,15 @@ def extract_tmids_from_urls(value):
         )
 
         for match in matches:
-            if is_valid_tmid(match):
-                found_tmids.add(match)
+            if is_valid_identifier(match):
+                found.add(match)
 
-    return found_tmids
-
-
-def first_existing(data, candidate_keys):
-    """
-    Zwraca pierwszą znalezioną niepustą wartość
-    spośród podanych nazw pól.
-    """
-
-    if not isinstance(data, dict):
-        return None
-
-    for key in candidate_keys:
-        value = data.get(key)
-
-        if value not in (None, ""):
-            return value
-
-    return None
+    return found
 
 
 def find_first_value_recursive(value, candidate_keys):
-    """
-    Rekurencyjnie szuka pierwszej wartości dla jednej
-    z podanych nazw pól.
-
-    Jest używana, ponieważ JSON meczu N01 może mieć dane
-    zagnieżdżone w dodatkowych obiektach.
-    """
-
     normalized_keys = {
-        key.lower()
+        str(key).lower()
         for key in candidate_keys
     }
 
@@ -304,81 +218,7 @@ def find_first_value_recursive(value, candidate_keys):
     return None
 
 
-def parse_match_date(data):
-    """
-    Próbuje odczytać datę meczu z kilku możliwych pól.
-    """
-
-    raw_value = find_first_value_recursive(
-        data,
-        [
-            "match_date",
-            "date",
-            "start_date",
-            "started_at",
-            "datetime",
-            "matchDate",
-            "startDate",
-        ],
-    )
-
-    if raw_value in (None, ""):
-        return None
-
-    if isinstance(raw_value, datetime):
-        return raw_value
-
-    if isinstance(raw_value, (int, float)):
-        try:
-            return datetime.fromtimestamp(
-                raw_value
-            )
-        except (ValueError, OSError, OverflowError):
-            return None
-
-    text_value = str(raw_value).strip()
-
-    try:
-        return datetime.fromisoformat(
-            text_value.replace("Z", "+00:00")
-        )
-    except ValueError:
-        return None
-
-
-def json_signature(value):
-    """
-    Tworzy stabilny podpis JSON używany do wykrywania,
-    czy endpoint zwrócił drugi raz dokładnie tę samą stronę.
-    """
-
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-# ============================================================
-# ROZPOZNAWANIE REKORDÓW W ODPOWIEDZI HISTORII
-# ============================================================
-
 def get_records_list(value):
-    """
-    Próbuje odnaleźć właściwą listę rekordów w odpowiedzi
-    endpointu historii.
-
-    Obsługiwane przykłady:
-    - [{...}, {...}]
-    - {"data": [...]}
-    - {"list": [...]}
-    - {"items": [...]}
-    - {"rows": [...]}
-    - {"matches": [...]}
-    - lista zagnieżdżona głębiej w JSON.
-    """
-
     if isinstance(value, list):
         return value
 
@@ -405,68 +245,106 @@ def get_records_list(value):
 
     for candidate in value.values():
         if isinstance(candidate, dict):
-            nested_result = get_records_list(
-                candidate
-            )
+            nested = get_records_list(candidate)
 
-            if nested_result is not None:
-                return nested_result
+            if nested is not None:
+                return nested
 
     return None
 
 
-def count_json_records(value):
-    """
-    Zwraca liczbę rekordów na stronie historii.
-
-    Jeżeli nie uda się odnaleźć listy rekordów,
-    zwraca None.
-    """
-
-    records = get_records_list(value)
-
-    if records is None:
-        return None
-
-    return len(records)
-
-
 def response_is_empty(value):
-    """
-    Sprawdza, czy odpowiedź endpointu jest faktycznie pusta.
-    """
-
-    if value is None:
-        return True
-
-    if value == "":
-        return True
-
-    if value == []:
-        return True
-
-    if value == {}:
+    if value in (None, "", [], {}):
         return True
 
     records = get_records_list(value)
 
-    if records == []:
-        return True
+    return records == []
 
-    return False
+
+def json_signature(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 # ============================================================
-# POBIERANIE LISTY WYDARZEŃ LIGI
+# DANE JUŻ ZAPISANE W SUPABASE
+# ============================================================
+
+def get_existing_tmids(conn):
+    """
+    Pobiera jednorazowo wszystkie tmid już zapisane w matches.
+
+    Dzięki temu nie wykonujemy osobnego zapytania SQL
+    dla każdego meczu.
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select tmid
+            from public.matches;
+            """
+        )
+
+        return {
+            str(row[0]).strip()
+            for row in cur.fetchall()
+            if row[0] not in (None, "")
+        }
+
+
+# ============================================================
+# ŹRÓDŁA
+# ============================================================
+
+def get_active_sources(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select
+                id,
+                source_url,
+                source_type
+            from public.source_urls
+            where is_active = true
+            order by id;
+            """
+        )
+
+        return cur.fetchall()
+
+
+def update_source_status(
+    conn,
+    source_id,
+    error_message=None,
+):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            update public.source_urls
+            set
+                last_checked_at = now(),
+                last_error = %s
+            where id = %s;
+            """,
+            (
+                error_message,
+                source_id,
+            ),
+        )
+
+
+# ============================================================
+# LISTA WYDARZEŃ LIGI
 # ============================================================
 
 def download_league_events(source_url):
-    """
-    Pobiera wszystkie wydarzenia przypisane do ligi.
-
-    Wynikiem są identyfikatory tdid.
-    """
-
     league_id = get_league_id(source_url)
 
     endpoint_url = (
@@ -495,7 +373,7 @@ def download_league_events(source_url):
     }
 
     logging.info(
-        "Pobieranie listy wydarzeń ligi: %s",
+        "Pobieranie wydarzeń ligi %s",
         league_id,
     )
 
@@ -506,143 +384,54 @@ def download_league_events(source_url):
         timeout=REQUEST_TIMEOUT,
     )
 
-    logging.info(
-        "Endpoint wydarzeń ligi zwrócił HTTP %s",
-        response.status_code,
-    )
-
     response.raise_for_status()
 
     try:
         data = response.json()
 
     except requests.JSONDecodeError as exc:
-        logging.error(
-            "Odpowiedź endpointu ligi nie jest JSON-em. "
-            "Początek odpowiedzi:\n%s",
-            response.text[:3000],
-        )
-
         raise ValueError(
-            "Endpoint listy wydarzeń ligi "
-            "nie zwrócił poprawnego JSON."
+            "Endpoint wydarzeń ligi nie zwrócił JSON."
         ) from exc
-
-    logging.info(
-        "Typ odpowiedzi listy wydarzeń: %s",
-        type(data).__name__,
-    )
-
-    logging.info(
-        "LEAGUE EVENTS JSON:\n%s",
-        json.dumps(
-            data,
-            ensure_ascii=False,
-            indent=2,
-        )[:30000],
-    )
-
-    tournament_ids = extract_ids_by_key(
-        data,
-        "tdid",
-    )
 
     tournament_ids = {
         tdid
-        for tdid in tournament_ids
-        if is_valid_tdid(tdid)
-    }
-
-    direct_tmids = extract_ids_by_key(
-        data,
-        "tmid",
-    )
-
-    direct_tmids.update(
-        extract_tmids_from_urls(data)
-    )
-
-    direct_tmids = {
-        tmid
-        for tmid in direct_tmids
-        if is_valid_tmid(tmid)
+        for tdid in extract_ids_by_key(data, "tdid")
+        if is_valid_identifier(tdid)
     }
 
     logging.info(
-        "Liczba znalezionych tdid: %s",
+        "Liga %s: znaleziono %s wydarzeń TDID.",
+        league_id,
         len(tournament_ids),
     )
 
-    if tournament_ids:
-        logging.info(
-            "ZNALEZIONE TDID:"
-        )
-
-        for tournament_id in sorted(
-            tournament_ids
-        ):
-            logging.info(
-                "TDID: %s",
-                tournament_id,
-            )
-    else:
-        logging.warning(
-            "W odpowiedzi endpointu ligi "
-            "nie znaleziono żadnych tdid."
-        )
-
-    logging.info(
-        "Liczba tmid znalezionych bezpośrednio "
-        "w odpowiedzi ligi: %s",
-        len(direct_tmids),
-    )
-
-    return {
-        "data": data,
-        "tdids": tournament_ids,
-        "tmids": direct_tmids,
-    }
+    return tournament_ids
 
 
 # ============================================================
-# POBIERANIE TMID DLA JEDNEGO WYDARZENIA
+# HISTORIA ZAKOŃCZONYCH MECZÓW
 # ============================================================
 
-def download_tournament_tmids(tdid):
+def download_tournament_tmids(
+    tdid,
+    existing_tmids,
+):
     """
-    Pobiera wszystkie mecze wydarzenia za pomocą stronicowania:
+    Pobiera identyfikatory zakończonych meczów z historii
+    konkretnego wydarzenia.
 
-    skip=0
-    skip=30
-    skip=60
-    skip=90
-    itd.
-
-    Pętla kończy się, gdy:
-    - endpoint zwróci pustą odpowiedź,
-    - lista rekordów będzie pusta,
-    - zwróconych zostanie mniej niż 30 rekordów,
-    - kolejna odpowiedź będzie identyczna,
-    - kolejna strona nie będzie zawierać nowych danych,
-    - zostanie osiągnięty limit bezpieczeństwa.
+    Endpoint jest stronicowany:
+    skip=0, 30, 60, 90 itd.
     """
 
-    if not is_valid_tdid(tdid):
-        raise ValueError(
-            f"Nieprawidłowy format tdid: {tdid}"
-        )
+    all_history_tmids = set()
+    new_tmids = set()
 
-    page_size = TOURNAMENT_PAGE_SIZE
+    previous_signature = None
     skip = 0
 
-    all_tmids = set()
-    previous_page_signature = None
-
-    logging.info(
-        "Rozpoczęcie pobierania meczów "
-        "dla wydarzenia TDID: %s",
-        tdid,
-    )
+    consecutive_existing_pages = 0
 
     for page_number in range(
         1,
@@ -653,7 +442,7 @@ def download_tournament_tmids(tdid):
             f"?cmd=get_t_list"
             f"&tdid={tdid}"
             f"&skip={skip}"
-            f"&count={page_size}"
+            f"&count={TOURNAMENT_PAGE_SIZE}"
             f"&name="
         )
 
@@ -667,24 +456,10 @@ def download_tournament_tmids(tdid):
             ),
         }
 
-        logging.info(
-            "TDID %s: pobieranie strony %s, skip=%s",
-            tdid,
-            page_number,
-            skip,
-        )
-
         response = session.post(
             endpoint_url,
             headers=headers,
             timeout=REQUEST_TIMEOUT,
-        )
-
-        logging.info(
-            "TDID %s, skip=%s: HTTP %s",
-            tdid,
-            skip,
-            response.status_code,
         )
 
         response.raise_for_status()
@@ -693,57 +468,36 @@ def download_tournament_tmids(tdid):
             page_data = response.json()
 
         except requests.JSONDecodeError as exc:
-            logging.error(
-                "TDID %s, skip=%s: odpowiedź "
-                "nie jest JSON-em.\n%s",
-                tdid,
-                skip,
-                response.text[:3000],
-            )
-
             raise ValueError(
-                f"Historia wydarzenia {tdid} "
-                f"dla skip={skip} nie zwróciła JSON."
+                f"Historia {tdid}, skip={skip} "
+                "nie zwróciła JSON."
             ) from exc
-
-        if page_number == 1:
-            logging.info(
-                "PRZYKŁADOWY JSON HISTORII TDID %s:\n%s",
-                tdid,
-                json.dumps(
-                    page_data,
-                    ensure_ascii=False,
-                    indent=2,
-                )[:15000],
-            )
 
         if response_is_empty(page_data):
             logging.info(
-                "TDID %s, skip=%s: pusta odpowiedź. "
-                "Koniec stronicowania.",
+                "TDID %s: koniec danych przy skip=%s.",
                 tdid,
                 skip,
             )
             break
 
-        current_signature = json_signature(
-            page_data
-        )
+        current_signature = json_signature(page_data)
 
-        if (
-            previous_page_signature is not None
-            and current_signature == previous_page_signature
-        ):
+        if current_signature == previous_signature:
             logging.warning(
-                "TDID %s, skip=%s: endpoint zwrócił "
-                "ponownie tę samą stronę. "
-                "Koniec stronicowania.",
+                "TDID %s: endpoint powtórzył stronę "
+                "przy skip=%s.",
                 tdid,
                 skip,
             )
             break
 
-        previous_page_signature = current_signature
+        previous_signature = current_signature
+
+        records = get_records_list(page_data)
+
+        if records is None:
+            records = []
 
         page_tmids = extract_ids_by_key(
             page_data,
@@ -757,242 +511,124 @@ def download_tournament_tmids(tdid):
         page_tmids = {
             tmid
             for tmid in page_tmids
-            if is_valid_tmid(tmid)
+            if is_valid_identifier(tmid)
         }
 
-        new_tmids = (
+        page_new_tmids = (
             page_tmids
-            - all_tmids
+            - existing_tmids
+            - all_history_tmids
         )
 
-        record_count = count_json_records(
-            page_data
-        )
+        all_history_tmids.update(page_tmids)
+        new_tmids.update(page_new_tmids)
 
         logging.info(
             "TDID %s, skip=%s: rekordów=%s, "
-            "tmid na stronie=%s, nowych tmid=%s",
+            "tmid=%s, nowych=%s, istniejących=%s",
             tdid,
             skip,
-            (
-                record_count
-                if record_count is not None
-                else "nieustalona liczba"
-            ),
+            len(records),
             len(page_tmids),
-            len(new_tmids),
+            len(page_new_tmids),
+            len(page_tmids & existing_tmids),
         )
 
-        if page_number == 1 and not page_tmids:
-            logging.warning(
-                "TDID %s: pierwsza odpowiedź zawiera dane, "
-                "ale nie znaleziono pola ani adresu z tmid. "
-                "Sprawdź sekcję PRZYKŁADOWY JSON HISTORII.",
-                tdid,
-            )
-
-        all_tmids.update(
-            page_tmids
-        )
-
-        if record_count == 0:
-            logging.info(
-                "TDID %s: lista rekordów jest pusta. "
-                "Koniec stronicowania.",
-                tdid,
-            )
-            break
+        if page_tmids and not page_new_tmids:
+            consecutive_existing_pages += 1
+        else:
+            consecutive_existing_pages = 0
 
         if (
-            record_count is not None
-            and record_count < page_size
+            STOP_AFTER_EXISTING_PAGES > 0
+            and consecutive_existing_pages
+            >= STOP_AFTER_EXISTING_PAGES
         ):
             logging.info(
-                "TDID %s: ostatnia strona zawiera "
-                "%s rekordów, czyli mniej niż %s. "
-                "Koniec stronicowania.",
+                "TDID %s: zatrzymanie po %s stronach "
+                "zawierających wyłącznie istniejące mecze.",
                 tdid,
-                record_count,
-                page_size,
+                consecutive_existing_pages,
             )
             break
 
-        if (
-            record_count is None
-            and not page_tmids
-        ):
-            logging.warning(
-                "TDID %s, skip=%s: nie udało się ustalić "
-                "liczby rekordów ani znaleźć tmid. "
-                "Koniec stronicowania.",
-                tdid,
-                skip,
-            )
+        if len(records) < TOURNAMENT_PAGE_SIZE:
             break
 
-        if (
-            page_number > 1
-            and not new_tmids
-        ):
-            logging.warning(
-                "TDID %s, skip=%s: strona nie zawiera "
-                "nowych tmid. Koniec stronicowania.",
-                tdid,
-                skip,
-            )
+        if not records and not page_tmids:
             break
 
-        skip += page_size
+        skip += TOURNAMENT_PAGE_SIZE
 
-        time.sleep(
-            REQUEST_DELAY_SECONDS
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    logging.info(
+        "TDID %s: historia zawiera %s tmid, "
+        "do pobrania pozostało %s.",
+        tdid,
+        len(all_history_tmids),
+        len(new_tmids),
+    )
+
+    return new_tmids
+
+
+def discover_new_completed_tmids(
+    source_url,
+    existing_tmids,
+):
+    """
+    Zwraca wyłącznie zakończone tmid,
+    których nie ma jeszcze w matches.
+    """
+
+    all_new_tmids = set()
+
+    if "/n01/league/portal.php" in source_url:
+        tournament_ids = download_league_events(
+            source_url
         )
+
+    elif "/n01/tournament/comp.php" in source_url:
+        tournament_ids = {
+            get_tournament_id(source_url)
+        }
 
     else:
-        logging.warning(
-            "TDID %s: osiągnięto limit bezpieczeństwa "
-            "%s stron.",
-            tdid,
-            MAX_TOURNAMENT_PAGES,
+        raise ValueError(
+            f"Nieobsługiwane źródło: {source_url}"
         )
 
-    logging.info(
-        "TDID %s: łącznie znaleziono "
-        "%s unikalnych tmid.",
-        tdid,
-        len(all_tmids),
-    )
-
-    return all_tmids
-
-
-# ============================================================
-# POBIERANIE WSZYSTKICH TMID DLA LIGI
-# ============================================================
-
-def download_all_league_tmids(source_url):
-    """
-    Realizuje pełny proces:
-
-    1. pobiera lgid z adresu ligi,
-    2. pobiera listę wydarzeń tdid,
-    3. pobiera wszystkie strony każdego wydarzenia,
-    4. zbiera unikalne tmid.
-    """
-
-    league_result = download_league_events(
-        source_url
-    )
-
-    tournament_ids = league_result["tdids"]
-
-    all_tmids = set(
-        league_result["tmids"]
-    )
-
-    logging.info(
-        "Liga %s: pobieranie meczów dla "
-        "%s wydarzeń.",
-        source_url,
-        len(tournament_ids),
-    )
-
-    for tournament_number, tdid in enumerate(
+    for number, tdid in enumerate(
         sorted(tournament_ids),
         start=1,
     ):
         logging.info(
-            "Przetwarzanie wydarzenia "
-            "%s z %s: %s",
-            tournament_number,
+            "Wydarzenie %s z %s: %s",
+            number,
             len(tournament_ids),
             tdid,
         )
 
-        try:
-            tournament_tmids = (
-                download_tournament_tmids(
-                    tdid
-                )
-            )
-
-            all_tmids.update(
-                tournament_tmids
-            )
-
-        except Exception as exc:
-            logging.exception(
-                "Nie udało się pobrać meczów "
-                "dla TDID %s: %s",
-                tdid,
-                exc,
-            )
-
-        time.sleep(
-            REQUEST_DELAY_SECONDS
+        event_new_tmids = download_tournament_tmids(
+            tdid,
+            existing_tmids | all_new_tmids,
         )
 
-    logging.info(
-        "Liga %s: łącznie znaleziono "
-        "%s unikalnych tmid.",
-        source_url,
-        len(all_tmids),
-    )
+        all_new_tmids.update(
+            event_new_tmids
+        )
 
-    return all_tmids
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    return all_new_tmids
 
 
 # ============================================================
-# ROZPOZNAWANIE RODZAJU ŹRÓDŁA
-# ============================================================
-
-def discover_tmids(source_url):
-    """
-    Rozpoznaje rodzaj źródła.
-
-    Obsługiwane źródła:
-
-    1. liga:
-       /n01/league/portal.php?lgid=...
-
-    2. konkretny turniej:
-       /n01/tournament/comp.php?id=...
-    """
-
-    if "/n01/league/portal.php" in source_url:
-        return download_all_league_tmids(
-            source_url
-        )
-
-    if "/n01/tournament/comp.php" in source_url:
-        tdid = get_tournament_id(
-            source_url
-        )
-
-        return download_tournament_tmids(
-            tdid
-        )
-
-    raise ValueError(
-        "Nieobsługiwany rodzaj źródła: "
-        f"{source_url}"
-    )
-
-
-# ============================================================
-# POBIERANIE JSON KONKRETNEGO MECZU
+# SZCZEGÓŁY MECZU
 # ============================================================
 
 def download_match(tmid):
-    """
-    Pobiera szczegółowy JSON konkretnego meczu.
-    """
-
-    if not is_valid_tmid(tmid):
-        raise ValueError(
-            f"Nieprawidłowy format tmid: {tmid}"
-        )
-
     payload = {
         "tmid": tmid,
     }
@@ -1017,73 +653,64 @@ def download_match(tmid):
         timeout=REQUEST_TIMEOUT,
     )
 
-    logging.info(
-        "Endpoint meczu %s zwrócił HTTP %s",
-        tmid,
-        response.status_code,
-    )
-
     response.raise_for_status()
 
     try:
         data = response.json()
 
     except requests.JSONDecodeError as exc:
-        logging.error(
-            "Odpowiedź endpointu meczu %s "
-            "nie jest JSON-em:\n%s",
-            tmid,
-            response.text[:2000],
-        )
-
         raise ValueError(
-            f"Odpowiedź dla meczu {tmid} "
-            "nie jest JSON-em."
+            f"Mecz {tmid} nie zwrócił JSON."
         ) from exc
 
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or not data:
         raise ValueError(
-            f"Nieoczekiwany typ odpowiedzi "
-            f"dla {tmid}: {type(data).__name__}"
-        )
-
-    if not data:
-        raise ValueError(
-            f"Endpoint zwrócił pusty JSON "
-            f"dla tmid: {tmid}"
+            f"Mecz {tmid} zwrócił pustą "
+            "lub nieprawidłową odpowiedź."
         )
 
     return data
 
 
-# ============================================================
-# ODCZYT ŹRÓDEŁ Z SUPABASE
-# ============================================================
+def parse_match_date(data):
+    raw_value = find_first_value_recursive(
+        data,
+        [
+            "match_date",
+            "date",
+            "start_date",
+            "started_at",
+            "datetime",
+            "matchDate",
+            "startDate",
+        ],
+    )
 
-def get_active_sources(conn):
-    """
-    Pobiera aktywne adresy z tabeli source_urls.
-    """
+    if raw_value in (None, ""):
+        return None
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select
-                id,
-                source_url,
-                source_type
-            from source_urls
-            where is_active = true
-            order by id;
-            """
+    if isinstance(raw_value, datetime):
+        return raw_value
+
+    if isinstance(raw_value, (int, float)):
+        try:
+            return datetime.fromtimestamp(
+                raw_value,
+                tz=timezone.utc,
+            )
+        except (ValueError, OSError, OverflowError):
+            return None
+
+    try:
+        return datetime.fromisoformat(
+            str(raw_value).replace(
+                "Z",
+                "+00:00",
+            )
         )
+    except ValueError:
+        return None
 
-        return cur.fetchall()
-
-
-# ============================================================
-# ZAPIS MECZU DO SUPABASE
-# ============================================================
 
 def save_match(
     conn,
@@ -1091,13 +718,6 @@ def save_match(
     requested_tmid,
     data,
 ):
-    """
-    Zapisuje nowy mecz albo aktualizuje istniejący.
-
-    Pełna odpowiedź N01 jest zapisywana
-    w kolumnie match_data typu jsonb.
-    """
-
     actual_tmid = str(
         find_first_value_recursive(
             data,
@@ -1106,10 +726,9 @@ def save_match(
         or requested_tmid
     ).strip()
 
-    if not is_valid_tmid(actual_tmid):
+    if not is_valid_identifier(actual_tmid):
         raise ValueError(
-            "Nieprawidłowy tmid zwrócony "
-            f"przez endpoint: {actual_tmid}"
+            f"Nieprawidłowy tmid: {actual_tmid}"
         )
 
     player_1 = find_first_value_recursive(
@@ -1145,9 +764,7 @@ def save_match(
         ],
     )
 
-    match_date = parse_match_date(
-        data
-    )
+    match_date = parse_match_date(data)
 
     match_url = (
         "https://n01darts.com/n01/league/"
@@ -1157,7 +774,7 @@ def save_match(
     with conn.cursor() as cur:
         cur.execute(
             """
-            insert into matches
+            insert into public.matches
             (
                 tmid,
                 source_url,
@@ -1186,22 +803,7 @@ def save_match(
                 now()
             )
             on conflict (tmid)
-            do update set
-                source_url = excluded.source_url,
-                match_url = excluded.match_url,
-                match_data = excluded.match_data,
-                player_1 = excluded.player_1,
-                player_2 = excluded.player_2,
-                match_status = excluded.match_status,
-                match_date = excluded.match_date,
-                last_seen_at = now(),
-                updated_at =
-                    case
-                        when matches.match_data
-                             is distinct from excluded.match_data
-                        then now()
-                        else matches.updated_at
-                    end;
+            do nothing;
             """,
             (
                 actual_tmid,
@@ -1227,35 +829,7 @@ def save_match(
             ),
         )
 
-
-# ============================================================
-# STATUS ŹRÓDŁA
-# ============================================================
-
-def update_source_status(
-    conn,
-    source_id,
-    error_message=None,
-):
-    """
-    Aktualizuje datę ostatniego sprawdzenia źródła
-    oraz ewentualny komunikat błędu.
-    """
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            update source_urls
-            set
-                last_checked_at = now(),
-                last_error = %s
-            where id = %s;
-            """,
-            (
-                error_message,
-                source_id,
-            ),
-        )
+        return cur.rowcount == 1
 
 
 # ============================================================
@@ -1263,21 +837,11 @@ def update_source_status(
 # ============================================================
 
 def create_sync_log(conn):
-    """
-    Tworzy wpis rozpoczęcia synchronizacji.
-    """
-
     with conn.cursor() as cur:
         cur.execute(
             """
-            insert into sync_log
-            (
-                status
-            )
-            values
-            (
-                'running'
-            )
+            insert into public.sync_log(status)
+            values ('running')
             returning id;
             """
         )
@@ -1295,14 +859,10 @@ def finish_sync_log(
     status,
     message,
 ):
-    """
-    Aktualizuje wpis po zakończeniu synchronizacji.
-    """
-
     with conn.cursor() as cur:
         cur.execute(
             """
-            update sync_log
+            update public.sync_log
             set
                 finished_at = now(),
                 sources_processed = %s,
@@ -1326,45 +886,36 @@ def finish_sync_log(
 
 
 # ============================================================
-# GŁÓWNA SYNCHRONIZACJA
+# GŁÓWNY PROCES
 # ============================================================
 
 def main():
     sources_processed = 0
-    all_tmids_found = set()
-    matches_downloaded = 0
+    new_tmids_found = set()
+    matches_inserted = 0
     errors_count = 0
-
-    logging.info(
-        "Rozpoczęcie synchronizacji N01."
-    )
 
     with psycopg.connect(
         DATABASE_URL,
         autocommit=False,
     ) as conn:
 
-        log_id = create_sync_log(
-            conn
-        )
-
+        log_id = create_sync_log(conn)
         conn.commit()
 
         try:
-            sources = get_active_sources(
-                conn
+            existing_tmids = get_existing_tmids(conn)
+            sources = get_active_sources(conn)
+
+            logging.info(
+                "W Supabase istnieje już %s meczów.",
+                len(existing_tmids),
             )
 
             logging.info(
-                "Liczba aktywnych źródeł: %s",
+                "Liczba aktywnych źródeł: %s.",
                 len(sources),
             )
-
-            if not sources:
-                logging.warning(
-                    "Brak aktywnych adresów "
-                    "w tabeli source_urls."
-                )
 
             for (
                 source_id,
@@ -1381,45 +932,40 @@ def main():
                 )
 
                 try:
-                    source_tmids = discover_tmids(
-                        source_url
+                    source_new_tmids = (
+                        discover_new_completed_tmids(
+                            source_url,
+                            existing_tmids
+                            | new_tmids_found,
+                        )
                     )
 
-                    source_tmids = {
-                        tmid
-                        for tmid in source_tmids
-                        if is_valid_tmid(tmid)
-                    }
-
-                    all_tmids_found.update(
-                        source_tmids
+                    new_tmids_found.update(
+                        source_new_tmids
                     )
 
                     logging.info(
-                        "Źródło %s zwróciło %s "
-                        "unikalnych tmid.",
-                        source_url,
-                        len(source_tmids),
+                        "Źródło zawiera %s nowych "
+                        "zakończonych meczów.",
+                        len(source_new_tmids),
                     )
 
-                    for match_number, tmid in enumerate(
-                        sorted(source_tmids),
+                    for number, tmid in enumerate(
+                        sorted(source_new_tmids),
                         start=1,
                     ):
                         try:
                             logging.info(
-                                "Pobieranie meczu "
+                                "Pobieranie nowego meczu "
                                 "%s z %s: %s",
-                                match_number,
-                                len(source_tmids),
+                                number,
+                                len(source_new_tmids),
                                 tmid,
                             )
 
-                            match_data = download_match(
-                                tmid
-                            )
+                            match_data = download_match(tmid)
 
-                            save_match(
+                            inserted = save_match(
                                 conn,
                                 source_url,
                                 tmid,
@@ -1428,20 +974,27 @@ def main():
 
                             conn.commit()
 
-                            matches_downloaded += 1
+                            if inserted:
+                                matches_inserted += 1
+                                existing_tmids.add(tmid)
 
-                            logging.info(
-                                "Zapisano mecz: %s",
-                                tmid,
-                            )
+                                logging.info(
+                                    "Dodano nowy mecz: %s",
+                                    tmid,
+                                )
+                            else:
+                                logging.info(
+                                    "Mecz %s już istniał. "
+                                    "Pominięto.",
+                                    tmid,
+                                )
 
                         except Exception as exc:
                             conn.rollback()
                             errors_count += 1
 
                             logging.exception(
-                                "Błąd pobierania lub "
-                                "zapisywania meczu %s: %s",
+                                "Błąd meczu %s: %s",
                                 tmid,
                                 exc,
                             )
@@ -1476,17 +1029,17 @@ def main():
 
                     conn.commit()
 
-            final_status = (
+            status = (
                 "success"
                 if errors_count == 0
                 else "completed_with_errors"
             )
 
-            final_message = (
+            message = (
                 f"Źródła: {sources_processed}; "
-                f"tmid: {len(all_tmids_found)}; "
-                f"mecze zapisane lub zaktualizowane: "
-                f"{matches_downloaded}; "
+                f"nowe zakończone tmid: "
+                f"{len(new_tmids_found)}; "
+                f"dodane mecze: {matches_inserted}; "
                 f"błędy: {errors_count}"
             )
 
@@ -1494,33 +1047,26 @@ def main():
                 conn,
                 log_id,
                 sources_processed,
-                len(all_tmids_found),
-                matches_downloaded,
+                len(new_tmids_found),
+                matches_inserted,
                 errors_count,
-                final_status,
-                final_message,
+                status,
+                message,
             )
 
             conn.commit()
 
-            logging.info(
-                final_message
-            )
+            logging.info(message)
 
         except Exception as exc:
             conn.rollback()
-
-            logging.exception(
-                "Krytyczny błąd synchronizacji: %s",
-                exc,
-            )
 
             finish_sync_log(
                 conn,
                 log_id,
                 sources_processed,
-                len(all_tmids_found),
-                matches_downloaded,
+                len(new_tmids_found),
+                matches_inserted,
                 errors_count + 1,
                 "failed",
                 str(exc)[:2000],
