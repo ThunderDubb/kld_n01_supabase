@@ -16,7 +16,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Pobranie repozytorium
@@ -31,7 +31,7 @@ jobs:
       - name: Instalacja bibliotek
         run: pip install -r requirements.txt
 
-      - name: Pobranie danych N01
+      - name: Synchronizacja nowych zakończonych meczów
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python main.py
