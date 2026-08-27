@@ -4,9 +4,6 @@ on:
   workflow_dispatch:
 
   schedule:
-    - cron: "17 4 * * *"
-    - cron: "17 10 * * *"
-    - cron: "17 16 * * *"
     - cron: "17 22 * * *"
 
 concurrency:
